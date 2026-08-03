@@ -1,0 +1,96 @@
+name: Build Smallest Binaries
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+  release:
+    types: [created]
+  workflow_dispatch:
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          check-latest: true
+
+      - name: Install Dependencies
+        run: sudo apt-get update && sudo apt-get install -y upx-ucl zip uuid-runtime
+
+      - name: Determine Release Tag
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "RELEASE_TAG=v-$(uuidgen)" >> $GITHUB_ENV
+          elif [ "${{ github.event_name }}" == "release" ]; then
+            echo "RELEASE_TAG=${{ github.event.release.tag_name }}" >> $GITHUB_ENV
+          else
+            echo "RELEASE_TAG=${{ github.ref_name }}" >> $GITHUB_ENV
+          fi
+
+      - name: Build Linux
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: |
+          go build -ldflags="-s -w" -trimpath -o cf-speedtest main.go
+          upx --best --lzma cf-speedtest
+          zip -9 linux-amd64-gnu-latest.zip cf-speedtest ip.txt ipv6.txt
+          rm cf-speedtest
+
+      - name: Build Windows
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: |
+          go build -ldflags="-s -w" -trimpath -o cf-speedtest.exe main.go
+          upx --best --lzma cf-speedtest.exe
+          zip -9 windows-x64-gnu-latest.zip cf-speedtest.exe ip.txt ipv6.txt
+          rm cf-speedtest.exe
+
+      - name: Build macOS
+        env:
+          GOOS: darwin
+          GOARCH: arm64
+          CGO_ENABLED: 0
+        run: |
+          go build -ldflags="-s -w" -trimpath -o cf-speedtest main.go
+          upx --best --lzma cf-speedtest || echo "UPX skipped: not supported for darwin/arm64 cross-compile"
+          zip -9 macos-aarch64-latest.zip cf-speedtest ip.txt ipv6.txt
+          rm cf-speedtest
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-binaries
+          path: |
+            linux-amd64-gnu-latest.zip
+            windows-x64-gnu-latest.zip
+            macos-aarch64-latest.zip
+
+      - name: Create Release and Upload Assets
+        if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: Release ${{ env.RELEASE_TAG }}
+          generate_release_notes: true
+          make_latest: true
+          files: |
+            linux-amd64-gnu-latest.zip
+            windows-x64-gnu-latest.zip
+            macos-aarch64-latest.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
