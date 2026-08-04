@@ -56,13 +56,6 @@ cd cf-speedtest
 CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o cf-speedtest .
 ```
 
-For the smallest possible binary, compress the result with [UPX](https://upx.github.io/)
-(already wired up in `.github/workflows/release.yml`):
-
-```bash
-upx --best --lzma cf-speedtest
-```
-
 ## License
 
 MIT License
