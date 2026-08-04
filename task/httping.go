@@ -2,7 +2,6 @@ package task
 
 import (
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"regexp"
@@ -14,7 +13,6 @@ import (
 )
 
 var (
-	Httping           bool
 	HttpingStatusCode int
 	HttpingCFColo     string
 	HttpingCFColomap  *sync.Map
@@ -24,33 +22,28 @@ var (
 	reGcore   = regexp.MustCompile(`^[a-z]{2,4}`)
 )
 
-func (p *Ping) httping(ip *net.IPAddr) (int, time.Duration, string) {
+const defaultUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+func (p *Ping) httping(ip *net.IPAddr) ([]time.Duration, string) {
 	hc := http.Client{
-		Timeout: time.Second * 2,
-		Transport: &http.Transport{
-			DialContext: getDialContext(ip),
-		},
+		Timeout:   time.Second * 2,
+		Transport: &http.Transport{DialContext: getDialContext(ip)},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
 	defer hc.CloseIdleConnections()
 
-	// 预检：校验状态码 + 获取地区码
 	colo, ok := p.httpingPrecheck(&hc, ip)
 	if !ok {
-		return 0, 0, ""
+		return nil, ""
 	}
 
-	// 正式延迟测量
-	var (
-		success int
-		delay   time.Duration
-	)
+	var rtts []time.Duration
 	for i := 0; i < PingTimes; i++ {
 		req, err := http.NewRequest(http.MethodHead, URL, nil)
 		if err != nil {
-			log.Fatalf("创建 HTTP 请求失败：%v", err)
+			break
 		}
 		req.Header.Set("User-Agent", defaultUA)
 		if i == PingTimes-1 {
@@ -63,20 +56,14 @@ func (p *Ping) httping(ip *net.IPAddr) (int, time.Duration, string) {
 		}
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
-		success++
-		delay += time.Since(start)
+		rtts = append(rtts, time.Since(start))
 	}
-	return success, delay, colo
+	return rtts, colo
 }
-
-const defaultUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 func (p *Ping) httpingPrecheck(hc *http.Client, ip *net.IPAddr) (string, bool) {
 	req, err := http.NewRequest(http.MethodHead, URL, nil)
 	if err != nil {
-		if utils.Debug {
-			utils.Red.Printf("[调试] %s 创建请求失败：%v\n", ip, err)
-		}
 		return "", false
 	}
 	req.Header.Set("User-Agent", defaultUA)
@@ -84,7 +71,7 @@ func (p *Ping) httpingPrecheck(hc *http.Client, ip *net.IPAddr) (string, bool) {
 	resp, err := hc.Do(req)
 	if err != nil {
 		if utils.Debug {
-			utils.Red.Printf("[调试] %s 请求失败：%v\n", ip, err)
+			utils.Red.Printf("[debug] %s request failed: %v\n", ip, err)
 		}
 		return "", false
 	}
@@ -93,32 +80,28 @@ func (p *Ping) httpingPrecheck(hc *http.Client, ip *net.IPAddr) (string, bool) {
 		resp.Body.Close()
 	}()
 
-	// 修复原版 Bug：
-	// 原条件：HttpingStatusCode < 100 && HttpingStatusCode > 599
-	// 两个条件不可能同时成立（AND），导致自定义状态码校验完全失效。
-	// 正确条件：< 100 || > 599 （OR：超出合法范围则视为无效）
+	// valid range is 100-599; outside it we fall back to the 200/301/302 default
 	if HttpingStatusCode == 0 || HttpingStatusCode < 100 || HttpingStatusCode > 599 {
 		code := resp.StatusCode
 		if code != 200 && code != 301 && code != 302 {
 			if utils.Debug {
-				utils.Red.Printf("[调试] %s 状态码 %d 不在默认允许范围（200/301/302）\n", ip, code)
+				utils.Red.Printf("[debug] %s status %d not in default allowed set (200/301/302)\n", ip, code)
 			}
 			return "", false
 		}
 	} else if resp.StatusCode != HttpingStatusCode {
 		if utils.Debug {
-			utils.Red.Printf("[调试] %s 状态码 %d ≠ 指定值 %d\n", ip, resp.StatusCode, HttpingStatusCode)
+			utils.Red.Printf("[debug] %s status %d != expected %d\n", ip, resp.StatusCode, HttpingStatusCode)
 		}
 		return "", false
 	}
 
 	colo := getHeaderColo(resp.Header)
-
 	if HttpingCFColo != "" {
 		colo = p.filterColo(colo)
 		if colo == "" {
 			if utils.Debug {
-				utils.Red.Printf("[调试] %s 地区码不匹配指定范围\n", ip)
+				utils.Red.Printf("[debug] %s colo not in requested set\n", ip)
 			}
 			return "", false
 		}
@@ -140,7 +123,8 @@ func MapColoMap() *sync.Map {
 	return sm
 }
 
-// getHeaderColo 从响应头解析地区码，支持 Cloudflare / CDN77 / BunnyCDN / CloudFront / Fastly / Gcore
+// getHeaderColo extracts a colo/IATA code from common CDN response headers
+// (Cloudflare, CDN77, BunnyCDN, CloudFront, Fastly, Gcore).
 func getHeaderColo(h http.Header) string {
 	switch h.Get("server") {
 	case "cloudflare":

@@ -2,32 +2,31 @@ package task
 
 import (
 	"context"
-	"io"
 	"net"
 	"net/http"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/VividCortex/ewma"
 	"github.com/XIU2/CloudflareSpeedTest/utils"
 )
 
 const (
-	// 修复：原值 1024 字节太小，频繁系统调用影响速度，改为 8 KB
-	bufferSize     = 8 * 1024
+	bufferSize     = 32 * 1024
 	defaultURL     = "https://cf.xiu2.xyz/url"
 	defaultTimeout = 10 * time.Second
 	defaultTestNum = 10
 )
 
 var (
-	URL      = defaultURL
-	Timeout  = defaultTimeout
-	Disable  = false
-	TestCount = defaultTestNum
-	MinSpeed  = 0.0
+	URL             = defaultURL
+	Timeout         = defaultTimeout
+	Disable         = false
+	TestCount       = defaultTestNum
+	MinSpeed        = 0.0
+	DownloadThreads = 1
 )
 
 func checkDownloadDefaults() {
@@ -40,9 +39,12 @@ func checkDownloadDefaults() {
 	if TestCount <= 0 {
 		TestCount = defaultTestNum
 	}
+	if DownloadThreads <= 0 {
+		DownloadThreads = 1
+	}
 }
 
-// TestDownloadSpeed 对延迟测速结果逐一执行下载测速
+// TestDownloadSpeed runs the real HTTP download test over the latency-filtered candidates.
 func TestDownloadSpeed(ctx context.Context, ipSet utils.PingDelaySet) utils.DownloadSpeedSet {
 	checkDownloadDefaults()
 
@@ -50,7 +52,7 @@ func TestDownloadSpeed(ctx context.Context, ipSet utils.PingDelaySet) utils.Down
 		return utils.DownloadSpeedSet(ipSet)
 	}
 	if len(ipSet) == 0 {
-		utils.Yellow.Println("[信息] 延迟测速 IP 数量为 0，跳过下载测速。")
+		utils.Yellow.Println("[info] latency test returned 0 IPs, skipping download test.")
 		return nil
 	}
 
@@ -62,10 +64,9 @@ func TestDownloadSpeed(ctx context.Context, ipSet utils.PingDelaySet) utils.Down
 		TestCount = testNum
 	}
 
-	utils.Cyan.Printf("开始下载测速（下限：%.2f MB/s, 目标：%d 个, 队列：%d 个）\n",
-		MinSpeed, TestCount, testNum)
+	utils.Cyan.Printf("Download test started (min speed: %.2f MB/s, target: %d, pool: %d, threads/IP: %d)\n",
+		MinSpeed, TestCount, testNum, DownloadThreads)
 
-	// 让进度条与延迟测速进度条对齐（强迫症）
 	pad := strings.Repeat(" ", len(strconv.Itoa(len(ipSet))))
 	bar := utils.NewBar(TestCount, "     "+pad, "")
 
@@ -74,7 +75,7 @@ func TestDownloadSpeed(ctx context.Context, ipSet utils.PingDelaySet) utils.Down
 	for i := 0; i < testNum; i++ {
 		select {
 		case <-ctx.Done():
-			utils.Yellow.Println("\n[中断] 收到停止信号，结束下载测速...")
+			utils.Yellow.Println("\n[interrupt] stop signal received, ending download test...")
 			goto done
 		default:
 		}
@@ -99,7 +100,7 @@ done:
 	if MinSpeed == 0 {
 		speedSet = utils.DownloadSpeedSet(ipSet)
 	} else if utils.Debug && len(speedSet) == 0 {
-		utils.Yellow.Println("[调试] 无 IP 满足下载速度下限，返回全量数据以供参考。")
+		utils.Yellow.Println("[debug] no IP met the minimum speed, returning full set for reference.")
 		speedSet = utils.DownloadSpeedSet(ipSet)
 	}
 
@@ -107,7 +108,6 @@ done:
 	return speedSet
 }
 
-// getDialContext 返回强制路由到指定 IP 的 DialContext
 func getDialContext(ip *net.IPAddr) func(ctx context.Context, network, address string) (net.Conn, error) {
 	addr := formatAddr(ip, TCPPort)
 	return func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -115,23 +115,42 @@ func getDialContext(ip *net.IPAddr) func(ctx context.Context, network, address s
 	}
 }
 
-// downloadHandler 对单个 IP 执行下载测速，返回 (bytes/sec, 地区码)
+// downloadHandler fans out to DownloadThreads parallel connections per IP and sums their throughput.
 func downloadHandler(ctx context.Context, ip *net.IPAddr) (float64, string) {
-	var lastRedirectURL string
+	if DownloadThreads <= 1 {
+		return downloadOnce(ctx, ip)
+	}
+	var (
+		wg    sync.WaitGroup
+		mu    sync.Mutex
+		total float64
+		colo  string
+	)
+	wg.Add(DownloadThreads)
+	for i := 0; i < DownloadThreads; i++ {
+		go func() {
+			defer wg.Done()
+			speed, c := downloadOnce(ctx, ip)
+			mu.Lock()
+			total += speed
+			if colo == "" && c != "" {
+				colo = c
+			}
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	return total, colo
+}
 
+// downloadOnce measures average throughput of a single connection over the configured Timeout window.
+func downloadOnce(ctx context.Context, ip *net.IPAddr) (float64, string) {
 	client := &http.Client{
 		Transport: &http.Transport{DialContext: getDialContext(ip)},
 		Timeout:   Timeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			lastRedirectURL = req.URL.String()
 			if len(via) > 10 {
-				if utils.Debug {
-					utils.Red.Printf("[调试] %s 重定向次数超过 10 次，终止\n", ip)
-				}
 				return http.ErrUseLastResponse
-			}
-			if req.Header.Get("Referer") == defaultURL {
-				req.Header.Del("Referer")
 			}
 			return nil
 		},
@@ -140,9 +159,6 @@ func downloadHandler(ctx context.Context, ip *net.IPAddr) (float64, string) {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, URL, nil)
 	if err != nil {
-		if utils.Debug {
-			utils.Red.Printf("[调试] %s 创建请求失败：%v\n", ip, err)
-		}
 		return 0, ""
 	}
 	req.Header.Set("User-Agent", defaultUA)
@@ -150,7 +166,7 @@ func downloadHandler(ctx context.Context, ip *net.IPAddr) (float64, string) {
 	resp, err := client.Do(req)
 	if err != nil {
 		if utils.Debug {
-			logDownloadError(ip, err, 0, lastRedirectURL, nil)
+			utils.Red.Printf("[debug] %s download failed: %v\n", ip, err)
 		}
 		return 0, ""
 	}
@@ -158,85 +174,29 @@ func downloadHandler(ctx context.Context, ip *net.IPAddr) (float64, string) {
 
 	if resp.StatusCode != http.StatusOK {
 		if utils.Debug {
-			logDownloadError(ip, nil, resp.StatusCode, lastRedirectURL, resp)
+			utils.Red.Printf("[debug] %s download aborted, status %d\n", ip, resp.StatusCode)
 		}
 		return 0, ""
 	}
 
 	colo := getHeaderColo(resp.Header)
 
-	timeStart := time.Now()
-	timeEnd := timeStart.Add(Timeout)
-	timeSlice := Timeout / 100 // 将测速时段等分为 100 个时间片
-
-	contentLength := resp.ContentLength
 	buffer := make([]byte, bufferSize)
+	start := time.Now()
+	deadline := start.Add(Timeout)
+	var read int64
 
-	var (
-		contentRead     int64
-		lastContentRead int64
-		timeCounter     = 1
-	)
-	nextTime := timeStart.Add(timeSlice * time.Duration(timeCounter))
-	e := ewma.NewMovingAverage()
-
-	for contentLength != contentRead {
-		now := time.Now()
-		if now.After(nextTime) {
-			timeCounter++
-			nextTime = timeStart.Add(timeSlice * time.Duration(timeCounter))
-			e.Add(float64(contentRead - lastContentRead))
-			lastContentRead = contentRead
-		}
-		if now.After(timeEnd) {
-			break
-		}
+	for time.Now().Before(deadline) {
 		n, err := resp.Body.Read(buffer)
-		contentRead += int64(n)
+		read += int64(n)
 		if err != nil {
-			if err == io.EOF {
-				if contentLength == -1 {
-					break
-				}
-				// 文件下载提前完成：补算最后一片的速度
-				lastSlice := timeStart.Add(timeSlice * time.Duration(timeCounter-1))
-				elapsed := float64(now.Sub(lastSlice)) / float64(timeSlice)
-				if elapsed > 0 {
-					e.Add(float64(contentRead-lastContentRead) / elapsed)
-				}
-			}
 			break
 		}
 	}
 
-	// 修复原版速度公式：
-	// e.Value() 单位 = bytes / timeSlice，timeSlice = Timeout/100
-	// bytes/sec = e.Value() / timeSlice.Seconds()
-	//           = e.Value() / (Timeout.Seconds() / 100)
-	// 原版错误地写成 / (Timeout.Seconds() / 120)，导致速度虚高约 20%
-	return e.Value() / (Timeout.Seconds() / 100), colo
-}
-
-func logDownloadError(ip *net.IPAddr, err error, statusCode int, redirectURL string, resp *http.Response) {
-	finalURL := URL
-	if redirectURL != "" {
-		finalURL = redirectURL
-	} else if resp != nil && resp.Request != nil && resp.Request.URL != nil {
-		finalURL = resp.Request.URL.String()
+	elapsed := time.Since(start).Seconds()
+	if elapsed <= 0 {
+		return 0, colo
 	}
-	redirected := finalURL != URL
-
-	if statusCode > 0 {
-		if redirected {
-			utils.Red.Printf("[调试] %s 下载终止，状态码：%d，最终地址：%s\n", ip, statusCode, finalURL)
-		} else {
-			utils.Red.Printf("[调试] %s 下载终止，状态码：%d\n", ip, statusCode)
-		}
-	} else if err != nil {
-		if redirected {
-			utils.Red.Printf("[调试] %s 下载失败：%v，最终地址：%s\n", ip, err, finalURL)
-		} else {
-			utils.Red.Printf("[调试] %s 下载失败：%v\n", ip, err)
-		}
-	}
+	return float64(read) / elapsed, colo
 }

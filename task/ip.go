@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"fmt"
 	"io"
-	"log"
 	"math/rand"
 	"net"
 	"net/http"
@@ -17,66 +16,18 @@ import (
 const (
 	defaultInputFile   = "ip.txt"
 	defaultInputFileV6 = "ipv6.txt"
-
-	// Cloudflare 官方 IP 段列表，内容随时可能更新
-	remoteURLv4 = "https://www.cloudflare.com/ips-v4"
-	remoteURLv6 = "https://www.cloudflare.com/ips-v6"
+	remoteURLv4        = "https://www.cloudflare.com/ips-v4"
+	remoteURLv6        = "https://www.cloudflare.com/ips-v6"
 )
-
-// fetchRemoteCIDRs 从 Cloudflare 官方拉取最新 IP 段列表。
-// 超时 5s，失败返回 nil（调用方负责 fallback）。
-func fetchRemoteCIDRs(url string) ([]string, error) {
-	client := http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(url)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	var lines []string
-	for _, l := range strings.Split(strings.TrimSpace(string(body)), "\n") {
-		l = strings.TrimSpace(l)
-		if l != "" && !strings.HasPrefix(l, "#") {
-			lines = append(lines, l)
-		}
-	}
-	return lines, nil
-}
-
-// readLocalCIDRs 从本地文件读取 IP 段，文件不存在时返回 nil。
-func readLocalCIDRs(filename string) []string {
-	f, err := os.Open(filename)
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
-	var lines []string
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		l := strings.TrimSpace(sc.Text())
-		if l != "" && !strings.HasPrefix(l, "#") {
-			lines = append(lines, l)
-		}
-	}
-	return lines
-}
 
 var (
 	TestAll = false
 	IPFile  = defaultInputFile
 	IPText  string
 
-	// 修复：用独立 rand.Rand 实例，不再调用全局 rand.Seed（Go 1.20 已废弃）
 	rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 )
 
-// InitRandSeed 重置随机种子（保留兼容性）
 func InitRandSeed() {
 	rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 }
@@ -116,11 +67,13 @@ func (r *IPRanges) fixIP(ip string) string {
 	return ip
 }
 
-func (r *IPRanges) parseCIDR(ip string) {
+func (r *IPRanges) parseCIDR(ip string) error {
 	var err error
-	if r.firstIP, r.ipNet, err = net.ParseCIDR(r.fixIP(ip)); err != nil {
-		log.Fatalf("解析 CIDR 失败 [%s]：%v", ip, err)
+	r.firstIP, r.ipNet, err = net.ParseCIDR(r.fixIP(ip))
+	if err != nil {
+		return fmt.Errorf("invalid CIDR %q: %w", ip, err)
 	}
+	return nil
 }
 
 func (r *IPRanges) appendIPv4(d byte) {
@@ -183,7 +136,6 @@ func (r *IPRanges) chooseIPv6() {
 		copy(target, r.firstIP)
 		r.appendIP(target)
 
-		// 从倒数第三位开始向高位进位
 		for i := 13; i >= 0; i-- {
 			prev := r.firstIP[i]
 			r.firstIP[i] += randByte(255) + 1
@@ -194,78 +146,110 @@ func (r *IPRanges) chooseIPv6() {
 	}
 }
 
-// loadIPRanges 解析待测 IP 列表，优先级：
-//   1. -ip 参数直接指定（最高优先级，直接返回）
-//   2. -f 指定了非默认文件（用户明确指定，直接读本地）
-//   3. 默认模式：先尝试从 Cloudflare 官网拉取最新列表，失败则读本地 ip.txt / ipv6.txt
-func loadIPRanges() []*net.IPAddr {
-	ranges := newIPRanges()
-
-	// ── 优先级 1：-ip 直接指定 ──────────────────────────────────
-	if IPText != "" {
-		for _, ip := range strings.Split(IPText, ",") {
-			ip = strings.TrimSpace(ip)
-			if ip == "" {
-				continue
-			}
-			ranges.parseCIDR(ip)
-			if isIPv4(ip) {
-				ranges.chooseIPv4()
-			} else {
-				ranges.chooseIPv6()
-			}
-		}
-		return ranges.ips
-	}
-
-	// ── 优先级 2：-f 指定了非默认文件 ──────────────────────────
-	userSpecifiedFile := IPFile != "" && IPFile != defaultInputFile
-	if userSpecifiedFile {
-		lines := readLocalCIDRs(IPFile)
-		if len(lines) == 0 {
-			log.Fatalf("IP 文件为空或不存在：%s", IPFile)
-		}
-		ranges.parseCIDRLines(lines)
-		return ranges.ips
-	}
-
-	// ── 优先级 3：默认模式，自动拉取 + 本地兜底 ────────────────
-	v4lines := fetchWithFallback(remoteURLv4, defaultInputFile, "IPv4")
-	v6lines := fetchWithFallback(remoteURLv6, defaultInputFileV6, "IPv6")
-
-	all := append(v4lines, v6lines...)
-	if len(all) == 0 {
-		log.Fatal("无法获取任何 IP 段，请检查网络或手动指定 -f 文件。")
-	}
-	ranges.parseCIDRLines(all)
-	return ranges.ips
-}
-
-// fetchWithFallback 先拉远程，失败则读本地文件，两者都失败则返回 nil。
-func fetchWithFallback(remoteURL, localFile, label string) []string {
-	lines, err := fetchRemoteCIDRs(remoteURL)
-	if err == nil && len(lines) > 0 {
-		fmt.Printf("[IP 列表] %s：从官网获取 %d 条\n", label, len(lines))
-		return lines
-	}
-	// 远程失败，降级到本地
-	lines = readLocalCIDRs(localFile)
-	if len(lines) > 0 {
-		fmt.Printf("[IP 列表] %s：官网不可达，使用本地 %s（%d 条）\n", label, localFile, len(lines))
-		return lines
-	}
-	fmt.Printf("[IP 列表] %s：远程和本地均不可用，跳过\n", label)
-	return nil
-}
-
-// parseCIDRLines 批量解析并生成待测 IP
 func (r *IPRanges) parseCIDRLines(lines []string) {
 	for _, line := range lines {
-		r.parseCIDR(line)
+		if err := r.parseCIDR(line); err != nil {
+			fmt.Fprintln(os.Stderr, "[warn]", err)
+			continue
+		}
 		if isIPv4(line) {
 			r.chooseIPv4()
 		} else {
 			r.chooseIPv6()
 		}
 	}
+}
+
+func fetchRemoteCIDRs(url string) ([]string, error) {
+	client := http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var lines []string
+	for _, l := range strings.Split(strings.TrimSpace(string(body)), "\n") {
+		l = strings.TrimSpace(l)
+		if l != "" && !strings.HasPrefix(l, "#") {
+			lines = append(lines, l)
+		}
+	}
+	return lines, nil
+}
+
+func readLocalCIDRs(filename string) []string {
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	var lines []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		l := strings.TrimSpace(sc.Text())
+		if l != "" && !strings.HasPrefix(l, "#") {
+			lines = append(lines, l)
+		}
+	}
+	return lines
+}
+
+func fetchWithFallback(remoteURL, localFile, label string) []string {
+	lines, err := fetchRemoteCIDRs(remoteURL)
+	if err == nil && len(lines) > 0 {
+		fmt.Printf("[ip pool] %s: fetched %d ranges from cloudflare.com\n", label, len(lines))
+		return lines
+	}
+	lines = readLocalCIDRs(localFile)
+	if len(lines) > 0 {
+		fmt.Printf("[ip pool] %s: remote unreachable, using local %s (%d ranges)\n", label, localFile, len(lines))
+		return lines
+	}
+	fmt.Printf("[ip pool] %s: remote and local both unavailable, skipped\n", label)
+	return nil
+}
+
+// loadIPRanges resolves the IP pool. Priority: -ip > -f (non-default) > remote fetch with local fallback.
+func loadIPRanges() []*net.IPAddr {
+	ranges := newIPRanges()
+
+	if IPText != "" {
+		var lines []string
+		for _, ip := range strings.Split(IPText, ",") {
+			ip = strings.TrimSpace(ip)
+			if ip != "" {
+				lines = append(lines, ip)
+			}
+		}
+		ranges.parseCIDRLines(lines)
+		return ranges.ips
+	}
+
+	if IPFile != "" && IPFile != defaultInputFile {
+		lines := readLocalCIDRs(IPFile)
+		if len(lines) == 0 {
+			fmt.Fprintf(os.Stderr, "[error] IP file is empty or missing: %s\n", IPFile)
+			os.Exit(1)
+		}
+		ranges.parseCIDRLines(lines)
+		return ranges.ips
+	}
+
+	v4lines := fetchWithFallback(remoteURLv4, defaultInputFile, "IPv4")
+	v6lines := fetchWithFallback(remoteURLv6, defaultInputFileV6, "IPv6")
+
+	all := append(v4lines, v6lines...)
+	if len(all) == 0 {
+		fmt.Fprintln(os.Stderr, "[error] no IP ranges available, check network or specify -f manually")
+		os.Exit(1)
+	}
+	ranges.parseCIDRLines(all)
+	return ranges.ips
 }

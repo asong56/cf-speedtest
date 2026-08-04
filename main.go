@@ -16,64 +16,84 @@ import (
 	"github.com/XIU2/CloudflareSpeedTest/utils"
 )
 
-var version = "v2.3.0"
+var version = "v3.0.0"
 
 func init() {
-	var printVersion bool
-	var minDelay, maxDelay, downloadTime, tcpTimeout int
-	var maxLossRate float64
+	var (
+		printVersion               bool
+		minDelay, maxDelay, jitter int
+		downloadTime, tcpTimeout   int
+		maxLossRate                float64
+		modeStr, sortStr           string
+	)
 
 	flag.IntVar(&task.Routines, "n", 200, "")
 	flag.IntVar(&task.PingTimes, "t", 4, "")
-	flag.IntVar(&task.TestCount, "dn", 10, "")
-	flag.IntVar(&downloadTime, "dt", 10, "")
+	flag.StringVar(&modeStr, "m", "tcp", "")
 	flag.IntVar(&task.TCPPort, "tp", 443, "")
 	flag.IntVar(&tcpTimeout, "ct", 1000, "")
-	flag.StringVar(&task.URL, "url", "https://cf.xiu2.xyz/url", "")
 
-	flag.BoolVar(&task.Httping, "httping", false, "")
-	flag.IntVar(&task.HttpingStatusCode, "httping-code", 0, "")
-	flag.StringVar(&task.HttpingCFColo, "cfcolo", "", "")
+	flag.IntVar(&task.HttpingStatusCode, "code", 0, "")
+	flag.StringVar(&task.HttpingCFColo, "colo", "", "")
+	flag.StringVar(&task.URL, "url", "https://cf.xiu2.xyz/url", "")
 
 	flag.IntVar(&maxDelay, "tl", 9999, "")
 	flag.IntVar(&minDelay, "tll", 0, "")
 	flag.Float64Var(&maxLossRate, "tlr", 1.0, "")
+	flag.IntVar(&jitter, "tj", 9999, "")
 	flag.Float64Var(&task.MinSpeed, "sl", 0.0, "")
 
-	flag.IntVar(&utils.PrintNum, "p", 10, "")
+	flag.IntVar(&task.TestCount, "dn", 10, "")
+	flag.IntVar(&downloadTime, "dt", 10, "")
+	flag.IntVar(&task.DownloadThreads, "dc", 1, "")
+	flag.BoolVar(&task.Disable, "dd", false, "")
+
+	flag.BoolVar(&task.EnableASN, "asn", false, "")
+
 	flag.StringVar(&task.IPFile, "f", "ip.txt", "")
 	flag.StringVar(&task.IPText, "ip", "", "")
-	flag.StringVar(&utils.Output, "o", "result.csv", "")
-
-	flag.BoolVar(&task.Disable, "dd", false, "")
 	flag.BoolVar(&task.TestAll, "allip", false, "")
+	flag.StringVar(&utils.Output, "o", "result.csv", "")
+	flag.IntVar(&utils.PrintNum, "p", 10, "")
+	flag.StringVar(&sortStr, "sort", "speed", "")
+
 	flag.BoolVar(&utils.Debug, "debug", false, "")
 	flag.BoolVar(&printVersion, "v", false, "")
 
-	// 完全接管 -h / --help 的输出
 	flag.Usage = printHelp
 	flag.Parse()
 
-	// 参数应用
-	if task.MinSpeed > 0 && time.Duration(maxDelay)*time.Millisecond == utils.InputMaxDelay {
-		utils.Yellow.Println("[提示] 使用 -sl 时建议同时指定 -tl，否则可能因凑不满 -dn 数量而持续测速。")
+	task.Mode = task.ParseMode(modeStr)
+
+	if task.MinSpeed > 0 && maxDelay == 9999 {
+		utils.Yellow.Println("[hint] combine -sl with -tl, otherwise the test may run for a long time trying to fill -dn.")
 	}
 	utils.InputMaxDelay = time.Duration(maxDelay) * time.Millisecond
 	utils.InputMinDelay = time.Duration(minDelay) * time.Millisecond
 	utils.InputMaxLossRate = float32(maxLossRate)
+	utils.InputMaxJitter = time.Duration(jitter) * time.Millisecond
 	task.Timeout = time.Duration(downloadTime) * time.Second
 	task.TCPConnectTimeout = time.Duration(tcpTimeout) * time.Millisecond
 	task.HttpingCFColomap = task.MapColoMap()
 
+	switch sortStr {
+	case "delay":
+		utils.ResultSort = utils.SortDelay
+	case "score":
+		utils.ResultSort = utils.SortScore
+	default:
+		utils.ResultSort = utils.SortSpeed
+	}
+
 	if printVersion {
 		fmt.Println("CloudflareSpeedTest", version)
-		fmt.Print("检查更新中... ")
+		fmt.Print("Checking for updates... ")
 		if newVer := checkUpdate(); newVer != "" {
 			fmt.Println()
-			utils.Yellow.Printf("发现新版本 [%s]，请前往以下地址下载更新：\n", newVer)
+			utils.Yellow.Printf("New version available [%s], download it here:\n", newVer)
 			utils.Yellow.Println("https://github.com/XIU2/CloudflareSpeedTest/releases/latest")
 		} else {
-			utils.Green.Println("当前已是最新版本。")
+			utils.Green.Println("Already up to date.")
 		}
 		os.Exit(0)
 	}
@@ -82,26 +102,27 @@ func init() {
 func main() {
 	task.InitRandSeed()
 
-	// 监听 Ctrl+C / SIGTERM，优雅退出并保留已有结果
+	// Ctrl+C / SIGTERM triggers a graceful stop that still prints whatever was found so far.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	fmt.Printf("# CloudflareSpeedTest %s\n\n", version)
 
-	pingData := task.NewPing(ctx).Run().FilterDelay().FilterLossRate()
+	pingData := task.NewPing(ctx).Run().FilterDelay().FilterLossRate().FilterJitter()
 	speedData := task.TestDownloadSpeed(ctx, pingData)
+	task.AnnotateASN(speedData)
 	utils.ExportCsv(speedData)
 	speedData.Print()
 	endPrint()
 }
 
-// endPrint 在 Windows 双击运行时防止窗口立即关闭
+// endPrint keeps the window open when double-clicked on Windows.
 func endPrint() {
 	if utils.NoPrintResult() {
 		return
 	}
 	if runtime.GOOS == "windows" {
-		fmt.Print("\n按下 回车键 或 Ctrl+C 退出。")
+		fmt.Print("\nPress Enter or Ctrl+C to exit.")
 		fmt.Scanln()
 	}
 }
@@ -120,95 +141,89 @@ func checkUpdate() string {
 	return ""
 }
 
-// printHelp 输出结构清晰的帮助文本
 func printHelp() {
-	// 颜色别名，方便下面使用
-	h := utils.Cyan.PrintfFunc()   // 分组标题
-	p := fmt.Printf               // 普通行
-	dim := utils.White.PrintfFunc() // 说明文字
+	h := utils.Cyan.Printf
+	p := fmt.Printf
+	dim := utils.White.Printf
 
 	p("\nCloudflareSpeedTest %s\n", version)
-	p("测试 Cloudflare 及各 CDN 所有 IP 的延迟和速度，找出最快节点。\n")
-	p("项目地址：https://github.com/XIU2/CloudflareSpeedTest\n")
-	p("\n")
-	dim("启动时自动从 cloudflare.com/ips-v4 和 ips-v6 拉取最新 IP 段；\n")
-	dim("网络不可达时自动降级读取本地 ip.txt / ipv6.txt 作为兜底。\n")
+	p("Finds the fastest, lowest-latency IPs for Cloudflare and other CDNs.\n")
+	p("Project: https://github.com/XIU2/CloudflareSpeedTest\n\n")
+	dim("On startup the IP pool is fetched from cloudflare.com/ips-v4 and ips-v6;\n")
+	dim("if that fails, it falls back to the local ip.txt / ipv6.txt files.\n")
 
-	// ── 延迟测速 ──────────────────────────────────────────────────
 	p("\n")
-	h("【延迟测速】\n")
-	p("  -n  <数量>   并发线程数              默认 200，最大 1000\n")
-	dim("               路由器等低性能设备建议设为 50 以下\n")
-	p("  -t  <次数>   单 IP 测速次数          默认 4 次\n")
-	p("  -tp <端口>   测速端口                默认 443\n")
-	p("  -ct <毫秒>   TCP 连接超时            默认 1000 ms\n")
-	dim("               网络较差时适当调小（如 500）可加速跳过超时节点\n")
+	h("[Latency Test]\n")
+	p("  -n   <num>    concurrency                 default 200, max 1000\n")
+	dim("               on low-power devices (routers) keep this under 50\n")
+	p("  -t   <num>    pings per IP                 default 4\n")
+	p("  -m   <mode>   probe mode: tcp/icmp/http    default tcp\n")
+	dim("               icmp needs root/administrator privileges\n")
+	p("  -tp  <port>   TCP port                     default 443\n")
+	p("  -ct  <ms>     connect/probe timeout        default 1000\n")
+	dim("               lower it (e.g. 500) on poor networks to skip dead IPs faster\n")
 
-	// ── HTTPing 模式 ──────────────────────────────────────────────
 	p("\n")
-	h("【HTTPing 模式】（默认为 TCPing）\n")
-	p("  -httping              切换为 HTTP 延迟测速\n")
-	p("  -httping-code <码>    有效 HTTP 状态码      默认 200/301/302\n")
-	p("  -cfcolo <地区码>      只保留指定地区的节点   仅 HTTPing 可用\n")
-	dim("               多个地区用英文逗号分隔，如 HKG,NRT,LAX,SJC\n")
-	dim("               地区码为 IATA 机场三字码\n")
-	p("  -url <地址>           测速/下载地址          默认使用内置地址\n")
-	dim("               建议自建，避免因公共地址不稳定影响结果\n")
+	h("[HTTP Mode Only]\n")
+	p("  -code <code>  expected HTTP status code    default 200/301/302\n")
+	p("  -colo <list>  keep only these colo codes    comma separated, e.g. HKG,NRT,LAX\n")
+	dim("               colo codes are IATA airport codes\n")
+	p("  -url  <addr>  probe / download URL          default built-in address\n")
+	dim("               self-hosting one avoids relying on a public endpoint\n")
 
-	// ── 过滤条件 ──────────────────────────────────────────────────
 	p("\n")
-	h("【过滤条件】\n")
-	p("  -tl  <毫秒>   平均延迟上限    默认 9999 ms（不过滤）\n")
-	p("  -tll <毫秒>   平均延迟下限    默认 0 ms（不过滤）\n")
-	p("  -tlr <比率>   丢包率上限      默认 1.00（不过滤），范围 0.00~1.00\n")
-	dim("               0 = 完全不允许丢包；0.2 = 丢包率不超过 20%%\n")
-	p("  -sl  <速度>   下载速度下限    默认 0 MB/s（不过滤），建议搭配 -tl\n")
-	dim("               凑够 -dn 数量后自动停止，未指定 -tl 时可能持续很久\n")
+	h("[Filters]\n")
+	p("  -tl  <ms>     max average delay             default 9999 (no filter)\n")
+	p("  -tll <ms>     min average delay              default 0 (no filter)\n")
+	p("  -tlr <rate>   max loss rate                  default 1.00 (no filter), range 0.00~1.00\n")
+	p("  -tj  <ms>     max jitter                     default 9999 (no filter)\n")
+	p("  -sl  <speed>  min download speed (MB/s)      default 0 (no filter), pair with -tl\n")
+	dim("               stops once -dn IPs qualify; without -tl this can run for a while\n")
 
-	// ── 下载测速 ──────────────────────────────────────────────────
 	p("\n")
-	h("【下载测速】\n")
-	p("  -dn <数量>    下载测速的 IP 数量     默认 10 个\n")
-	p("  -dt <秒>      单 IP 下载时长         默认 10 秒，不宜过短\n")
-	p("  -dd           禁用下载测速           结果改为按延迟排序\n")
+	h("[Download Test]\n")
+	p("  -dn <num>     number of IPs to test          default 10\n")
+	p("  -dt <sec>     per-IP duration                default 10, avoid going too low\n")
+	p("  -dc <num>     concurrent connections per IP   default 1\n")
+	p("  -dd           disable download test           results sorted by delay instead\n")
 
-	// ── 输入 / 输出 ───────────────────────────────────────────────
 	p("\n")
-	h("【输入 / 输出】\n")
-	p("  -f  <文件>    指定本地 IP 段文件      默认 ip.txt\n")
-	dim("               指定此参数后跳过远程拉取，直接读取本地文件\n")
-	dim("               文件每行一个 CIDR，支持 # 注释行\n")
-	p("  -ip <IP段>    直接指定 IP 段         多个以逗号分隔，优先级最高\n")
-	dim("               例：-ip 1.1.1.1,104.17.0.0/22,2606:4700::/32\n")
-	p("  -o  <文件>    输出 CSV 文件          默认 result.csv\n")
-	dim("               留空则不写文件：-o \"\"\n")
-	dim("               文件含 UTF-8 BOM，Windows Excel 可直接打开\n")
-	p("  -p  <数量>    终端打印行数           默认 10，0 = 不打印\n")
-	p("  -allip        测速 /24 段内所有 IP   默认每段随机取一个\n")
+	h("[Geolocation]\n")
+	p("  -asn          resolve origin ASN via DNS      slower, off by default\n")
 
-	// ── 其他 ──────────────────────────────────────────────────────
 	p("\n")
-	h("【其他】\n")
-	p("  -debug   输出详细调试日志\n")
-	p("  -v       显示版本并检查更新\n")
-	p("  -h       显示此帮助\n")
+	h("[Input / Output]\n")
+	p("  -f  <file>    local IP range file             default ip.txt\n")
+	dim("               setting this skips the remote fetch; one CIDR per line, # for comments\n")
+	p("  -ip <ranges>  test these IP/CIDR directly      comma separated, highest priority\n")
+	dim("               example: -ip 1.1.1.1,104.17.0.0/22,2606:4700::/32\n")
+	p("  -allip        test every IP in each /24 or /64 range instead of one random sample\n")
+	p("  -o  <file>    output CSV path                 default result.csv, \"\" = no file\n")
+	dim("               written with a UTF-8 BOM so Excel opens it cleanly on Windows\n")
+	p("  -p  <num>     rows printed to the terminal     default 10, 0 = print nothing\n")
+	p("  -sort <mode>  result order: speed/delay/score  default speed\n")
 
-	// ── 常用示例 ──────────────────────────────────────────────────
 	p("\n")
-	h("【常用示例】\n")
-	p("  # 快速扫描，只要延迟 200ms 以内的节点\n")
+	h("[Other]\n")
+	p("  -debug   print verbose debug logs\n")
+	p("  -v       print version and check for updates\n")
+	p("  -h       show this help\n")
+
+	p("\n")
+	h("[Examples]\n")
+	p("  # quick scan, only IPs under 200ms\n")
 	utils.Green.Println("  CloudflareSpeedTest -tl 200 -dd")
 	p("\n")
-	p("  # 找下载速度 ≥ 5 MB/s 且延迟 ≤ 150ms 的节点，输出前 20 条\n")
+	p("  # IPs at >= 5 MB/s and <= 150ms, print top 20\n")
 	utils.Green.Println("  CloudflareSpeedTest -tl 150 -sl 5 -p 20")
 	p("\n")
-	p("  # HTTPing 模式，只保留香港/东京/洛杉矶节点，丢包率 ≤ 10%%\n")
-	utils.Green.Println("  CloudflareSpeedTest -httping -cfcolo HKG,NRT,LAX -tlr 0.1")
+	p("  # HTTP mode, only HK/Tokyo/LA colos, loss rate <= 10%%\n")
+	utils.Green.Println("  CloudflareSpeedTest -m http -colo HKG,NRT,LAX -tlr 0.1")
 	p("\n")
-	p("  # 测试自定义 IP 段，500 线程，不写文件\n")
+	p("  # custom IP range, 500 threads, no CSV output\n")
 	utils.Green.Println("  CloudflareSpeedTest -ip 104.16.0.0/13 -n 500 -o \"\"")
 	p("\n")
-	p("  # 低性能设备（如路由器），降低线程和超时\n")
+	p("  # low-power device: fewer threads, shorter timeout\n")
 	utils.Green.Println("  CloudflareSpeedTest -n 50 -ct 500 -tl 300")
 	p("\n")
 }

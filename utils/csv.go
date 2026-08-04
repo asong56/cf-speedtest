@@ -3,7 +3,6 @@ package utils
 import (
 	"encoding/csv"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"strconv"
@@ -15,34 +14,49 @@ const (
 	maxDelay            = 9999 * time.Millisecond
 	minDelay            = 0 * time.Millisecond
 	maxLossRate float32 = 1.0
+	maxJitter           = 9999 * time.Millisecond
 )
 
 var (
 	InputMaxDelay    = maxDelay
 	InputMinDelay    = minDelay
 	InputMaxLossRate = maxLossRate
+	InputMaxJitter   = maxJitter
 	Output           = defaultOutput
 	PrintNum         = 10
 	Debug            = false
 )
 
+// SortMode selects how the final result set is ordered.
+type SortMode string
+
+const (
+	SortSpeed SortMode = "speed"
+	SortDelay SortMode = "delay"
+	SortScore SortMode = "score"
+)
+
+var ResultSort = SortSpeed
+
 func NoPrintResult() bool { return PrintNum == 0 }
 func noOutput() bool      { return Output == "" || Output == " " }
 
-// PingData 单次延迟测速结果
+// PingData holds one IP's raw latency-test result.
 type PingData struct {
 	IP       *net.IPAddr
 	Sended   int
 	Received int
 	Delay    time.Duration
+	Jitter   time.Duration
 	Colo     string
 }
 
-// CloudflareIPData 完整测速结果（延迟 + 下载速度）
+// CloudflareIPData adds download speed and geolocation to a PingData.
 type CloudflareIPData struct {
 	*PingData
 	lossRate      float32
 	DownloadSpeed float64
+	ASN           string
 }
 
 func (cf *CloudflareIPData) getLossRate() float32 {
@@ -52,10 +66,22 @@ func (cf *CloudflareIPData) getLossRate() float32 {
 	return cf.lossRate
 }
 
+// score blends speed/delay/jitter/loss into one number for -sort score.
+func (cf *CloudflareIPData) score() float64 {
+	speed := cf.DownloadSpeed / 1024 / 1024
+	delayMs := cf.Delay.Seconds() * 1000
+	jitterMs := cf.Jitter.Seconds() * 1000
+	return speed - delayMs/100 - jitterMs/100 - float64(cf.getLossRate())*20
+}
+
 func (cf *CloudflareIPData) toRow() []string {
 	colo := cf.Colo
 	if colo == "" {
 		colo = "N/A"
+	}
+	asn := cf.ASN
+	if asn == "" {
+		asn = "N/A"
 	}
 	return []string{
 		cf.IP.String(),
@@ -63,40 +89,40 @@ func (cf *CloudflareIPData) toRow() []string {
 		strconv.Itoa(cf.Received),
 		strconv.FormatFloat(float64(cf.getLossRate()), 'f', 2, 32),
 		strconv.FormatFloat(cf.Delay.Seconds()*1000, 'f', 2, 32),
+		strconv.FormatFloat(cf.Jitter.Seconds()*1000, 'f', 2, 32),
 		strconv.FormatFloat(cf.DownloadSpeed/1024/1024, 'f', 2, 32),
 		colo,
+		asn,
 	}
 }
 
-// ExportCsv 将结果写入 CSV。
-// 写入 UTF-8 BOM，确保 Windows Excel 直接打开不乱码。
+// ExportCsv writes results with a UTF-8 BOM so Excel opens them cleanly on Windows.
 func ExportCsv(data []CloudflareIPData) {
 	if noOutput() || len(data) == 0 {
 		return
 	}
 	fp, err := os.Create(Output)
 	if err != nil {
-		log.Fatalf("创建文件 [%s] 失败：%v", Output, err)
+		fmt.Fprintf(os.Stderr, "[error] cannot create file %s: %v\n", Output, err)
+		os.Exit(1)
 	}
 	defer fp.Close()
 
-	// UTF-8 BOM
 	fp.WriteString("\xEF\xBB\xBF")
 
 	w := csv.NewWriter(fp)
-	_ = w.Write([]string{"IP 地址", "已发送", "已接收", "丢包率", "平均延迟(ms)", "下载速度(MB/s)", "地区码"})
+	_ = w.Write([]string{"IP Address", "Sent", "Received", "Loss Rate", "Avg Delay(ms)", "Jitter(ms)", "Download Speed(MB/s)", "Colo", "ASN"})
 	for _, v := range data {
 		_ = w.Write(v.toRow())
 	}
 	w.Flush()
 	if err := w.Error(); err != nil {
-		log.Fatalf("写入 CSV 失败：%v", err)
+		fmt.Fprintf(os.Stderr, "[error] failed writing CSV: %v\n", err)
+		os.Exit(1)
 	}
 }
 
-// ---- 排序类型 ----
-
-// PingDelaySet 按丢包率升序、延迟升序排列
+// PingDelaySet sorts ascending by loss rate, then by delay.
 type PingDelaySet []CloudflareIPData
 
 func (s PingDelaySet) Len() int      { return len(s) }
@@ -109,19 +135,13 @@ func (s PingDelaySet) Less(i, j int) bool {
 	return s[i].Delay < s[j].Delay
 }
 
-// FilterDelay 过滤延迟不达标的 IP。
-//
-// 修复原版 Bug：原条件 `InputMaxDelay > maxDelay || InputMinDelay < minDelay`
-// 因为 maxDelay=9999ms、minDelay=0，用户输入的值永远在此范围内，
-// 导致该分支永远成立、过滤逻辑永远被跳过。
-// 正确做法：均为默认值时才跳过；否则执行过滤。
 func (s PingDelaySet) FilterDelay() (data PingDelaySet) {
 	if InputMaxDelay == maxDelay && InputMinDelay == minDelay {
 		return s
 	}
 	for _, v := range s {
 		if v.Delay > InputMaxDelay {
-			break // 已按延迟升序，后续必然超出上限
+			break // already sorted ascending by delay, nothing further qualifies
 		}
 		if v.Delay < InputMinDelay {
 			continue
@@ -131,34 +151,53 @@ func (s PingDelaySet) FilterDelay() (data PingDelaySet) {
 	return
 }
 
-// FilterLossRate 过滤丢包率不达标的 IP
 func (s PingDelaySet) FilterLossRate() (data PingDelaySet) {
 	if InputMaxLossRate >= maxLossRate {
 		return s
 	}
 	for _, v := range s {
 		if v.getLossRate() > InputMaxLossRate {
-			break // 已按丢包率升序
+			break // already sorted ascending by loss rate
 		}
 		data = append(data, v)
 	}
 	return
 }
 
-// DownloadSpeedSet 按下载速度降序排列
+func (s PingDelaySet) FilterJitter() (data PingDelaySet) {
+	if InputMaxJitter >= maxJitter {
+		return s
+	}
+	for _, v := range s {
+		if v.Jitter <= InputMaxJitter {
+			data = append(data, v)
+		}
+	}
+	return
+}
+
+// DownloadSpeedSet orders the final result set per ResultSort.
 type DownloadSpeedSet []CloudflareIPData
 
-func (s DownloadSpeedSet) Len() int           { return len(s) }
-func (s DownloadSpeedSet) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
-func (s DownloadSpeedSet) Less(i, j int) bool { return s[i].DownloadSpeed > s[j].DownloadSpeed }
+func (s DownloadSpeedSet) Len() int      { return len(s) }
+func (s DownloadSpeedSet) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+func (s DownloadSpeedSet) Less(i, j int) bool {
+	switch ResultSort {
+	case SortDelay:
+		return s[i].Delay < s[j].Delay
+	case SortScore:
+		return s[i].score() > s[j].score()
+	default:
+		return s[i].DownloadSpeed > s[j].DownloadSpeed
+	}
+}
 
-// Print 格式化打印测速结果
 func (s DownloadSpeedSet) Print() {
 	if NoPrintResult() {
 		return
 	}
 	if len(s) == 0 {
-		fmt.Println("\n[信息] 测速结果数量为 0，跳过打印。")
+		fmt.Println("\n[info] result set is empty, nothing to print.")
 		return
 	}
 
@@ -167,7 +206,6 @@ func (s DownloadSpeedSet) Print() {
 		printNum = len(s)
 	}
 
-	// 检测是否含 IPv6，自动调整列宽
 	hasIPv6 := false
 	for i := 0; i < printNum; i++ {
 		if len(s[i].IP.String()) > 15 {
@@ -178,20 +216,20 @@ func (s DownloadSpeedSet) Print() {
 
 	var headFmt, dataFmt string
 	if hasIPv6 {
-		headFmt = "%-40s%-6s%-6s%-8s%-12s%-16s%-6s\n"
-		dataFmt = "%-42s%-8s%-8s%-10s%-14s%-18s%-8s\n"
+		headFmt = "%-40s%-6s%-6s%-8s%-10s%-10s%-16s%-6s%-10s\n"
+		dataFmt = "%-42s%-8s%-8s%-10s%-12s%-12s%-18s%-8s%-10s\n"
 	} else {
-		headFmt = "%-16s%-6s%-6s%-8s%-12s%-16s%-6s\n"
-		dataFmt = "%-18s%-8s%-8s%-10s%-14s%-18s%-8s\n"
+		headFmt = "%-16s%-6s%-6s%-8s%-10s%-10s%-16s%-6s%-10s\n"
+		dataFmt = "%-18s%-8s%-8s%-10s%-12s%-12s%-18s%-8s%-10s\n"
 	}
 
-	Cyan.Printf(headFmt, "IP 地址", "发送", "接收", "丢包率", "平均延迟", "下载速度(MB/s)", "地区")
+	Cyan.Printf(headFmt, "IP Address", "Sent", "Recv", "Loss", "Delay", "Jitter", "Speed(MB/s)", "Colo", "ASN")
 	for i := 0; i < printNum; i++ {
 		r := s[i].toRow()
-		fmt.Printf(dataFmt, r[0], r[1], r[2], r[3], r[4]+"ms", r[5], r[6])
+		fmt.Printf(dataFmt, r[0], r[1], r[2], r[3], r[4]+"ms", r[5]+"ms", r[6], r[7], r[8])
 	}
 
 	if !noOutput() {
-		fmt.Printf("\n完整结果已写入 %s，可用记事本或表格软件查看。\n", Output)
+		fmt.Printf("\nFull results written to %s\n", Output)
 	}
 }

@@ -13,18 +13,38 @@ import (
 )
 
 const (
-	maxRoutine       = 1000
+	maxRoutines      = 1000
 	defaultRoutines  = 200
 	defaultPort      = 443
 	defaultPingTimes = 4
 )
 
+// ProbeMode selects which protocol the latency test uses.
+type ProbeMode string
+
+const (
+	ModeTCP  ProbeMode = "tcp"
+	ModeICMP ProbeMode = "icmp"
+	ModeHTTP ProbeMode = "http"
+)
+
+func ParseMode(s string) ProbeMode {
+	switch s {
+	case "icmp":
+		return ModeICMP
+	case "http", "https", "httping":
+		return ModeHTTP
+	default:
+		return ModeTCP
+	}
+}
+
 var (
-	Routines          = defaultRoutines
-	TCPPort       int = defaultPort
-	PingTimes     int = defaultPingTimes
-	// 修复：TCP 超时现在可通过 -ct 参数配置，原版硬编码 1s
-	TCPConnectTimeout = time.Second
+	Routines              = defaultRoutines
+	TCPPort           int  = defaultPort
+	PingTimes         int  = defaultPingTimes
+	TCPConnectTimeout      = time.Second
+	Mode                   = ModeTCP
 )
 
 type Ping struct {
@@ -41,8 +61,8 @@ func checkPingDefaults() {
 	if Routines <= 0 {
 		Routines = defaultRoutines
 	}
-	if Routines > maxRoutine {
-		Routines = maxRoutine
+	if Routines > maxRoutines {
+		Routines = maxRoutines
 	}
 	if TCPPort <= 0 || TCPPort >= 65535 {
 		TCPPort = defaultPort
@@ -63,7 +83,7 @@ func NewPing(ctx context.Context) *Ping {
 		ips: ips,
 		csv: make(utils.PingDelaySet, 0, len(ips)),
 		sem: make(chan struct{}, Routines),
-		bar: utils.NewBar(len(ips), "可用:", ""),
+		bar: utils.NewBar(len(ips), "Available:", ""),
 	}
 }
 
@@ -72,12 +92,8 @@ func (p *Ping) Run() utils.PingDelaySet {
 		return p.csv
 	}
 
-	mode := "TCP"
-	if Httping {
-		mode = "HTTP"
-	}
-	utils.Cyan.Printf("开始延迟测速（模式：%s, 端口：%d, 范围：%d~%d ms, 丢包上限：%.2f）\n",
-		mode, TCPPort,
+	utils.Cyan.Printf("Latency test started (mode: %s, port: %d, range: %d~%dms, max loss: %.2f)\n",
+		Mode, TCPPort,
 		utils.InputMinDelay.Milliseconds(), utils.InputMaxDelay.Milliseconds(),
 		utils.InputMaxLossRate,
 	)
@@ -85,7 +101,7 @@ func (p *Ping) Run() utils.PingDelaySet {
 	for _, ip := range p.ips {
 		select {
 		case <-p.ctx.Done():
-			utils.Yellow.Println("\n[中断] 收到停止信号，结束延迟测速...")
+			utils.Yellow.Println("\n[interrupt] stop signal received, ending latency test...")
 			goto done
 		default:
 		}
@@ -105,7 +121,7 @@ func (p *Ping) worker(ip *net.IPAddr) {
 		p.wg.Done()
 		<-p.sem
 	}()
-	p.tcpingHandler(ip)
+	p.handle(ip)
 }
 
 func (p *Ping) tcping(ip *net.IPAddr) (bool, time.Duration) {
@@ -118,17 +134,22 @@ func (p *Ping) tcping(ip *net.IPAddr) (bool, time.Duration) {
 	return true, time.Since(start)
 }
 
-func (p *Ping) checkConnection(ip *net.IPAddr) (recv int, total time.Duration, colo string) {
-	if Httping {
+// probe dispatches to the configured protocol and returns per-attempt RTTs plus an optional colo code.
+func (p *Ping) probe(ip *net.IPAddr) ([]time.Duration, string) {
+	switch Mode {
+	case ModeHTTP:
 		return p.httping(ip)
-	}
-	for i := 0; i < PingTimes; i++ {
-		if ok, d := p.tcping(ip); ok {
-			recv++
-			total += d
+	case ModeICMP:
+		return p.icmping(ip)
+	default:
+		var rtts []time.Duration
+		for i := 0; i < PingTimes; i++ {
+			if ok, d := p.tcping(ip); ok {
+				rtts = append(rtts, d)
+			}
 		}
+		return rtts, ""
 	}
-	return
 }
 
 func (p *Ping) appendIPData(data *utils.PingData) {
@@ -137,28 +158,50 @@ func (p *Ping) appendIPData(data *utils.PingData) {
 	p.csv = append(p.csv, utils.CloudflareIPData{PingData: data})
 }
 
-func (p *Ping) tcpingHandler(ip *net.IPAddr) {
-	recv, totalDelay, colo := p.checkConnection(ip)
+func (p *Ping) handle(ip *net.IPAddr) {
+	rtts, colo := p.probe(ip)
 
 	available := len(p.csv)
-	if recv != 0 {
+	if len(rtts) > 0 {
 		available++
 	}
 	p.bar.Grow(1, strconv.Itoa(available))
 
-	if recv == 0 {
+	if len(rtts) == 0 {
 		return
 	}
+	recv, avg, jitter := computeStats(rtts)
 	p.appendIPData(&utils.PingData{
 		IP:       ip,
 		Sended:   PingTimes,
 		Received: recv,
-		Delay:    totalDelay / time.Duration(recv),
+		Delay:    avg,
+		Jitter:   jitter,
 		Colo:     colo,
 	})
 }
 
-// formatAddr 格式化 "IP:port"，IPv6 自动加方括号
+// computeStats derives average delay and jitter (max-min swing) from raw RTT samples.
+func computeStats(rtts []time.Duration) (received int, avg, jitter time.Duration) {
+	received = len(rtts)
+	if received == 0 {
+		return
+	}
+	min, max, sum := rtts[0], rtts[0], time.Duration(0)
+	for _, d := range rtts {
+		sum += d
+		if d < min {
+			min = d
+		}
+		if d > max {
+			max = d
+		}
+	}
+	avg = sum / time.Duration(received)
+	jitter = max - min
+	return
+}
+
 func formatAddr(ip *net.IPAddr, port int) string {
 	if isIPv4(ip.String()) {
 		return fmt.Sprintf("%s:%d", ip.String(), port)
