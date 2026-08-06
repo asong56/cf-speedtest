@@ -52,7 +52,9 @@ func TestDownloadSpeed(ctx context.Context, ipSet utils.PingDelaySet) utils.Down
 		return utils.DownloadSpeedSet(ipSet)
 	}
 	if len(ipSet) == 0 {
-		utils.Yellow.Println("[info] latency test returned 0 IPs, skipping download test.")
+		if !utils.Quiet {
+			utils.Yellow.Println("[info] latency test returned 0 IPs, skipping download test.")
+		}
 		return nil
 	}
 
@@ -64,8 +66,10 @@ func TestDownloadSpeed(ctx context.Context, ipSet utils.PingDelaySet) utils.Down
 		TestCount = testNum
 	}
 
-	utils.Cyan.Printf("Download test started (min speed: %.2f MB/s, target: %d, pool: %d, threads/IP: %d)\n",
-		MinSpeed, TestCount, testNum, DownloadThreads)
+	if !utils.Quiet {
+		utils.Cyan.Printf("Download test started (min speed: %.2f MB/s, target: %d, pool: %d, threads/IP: %d)\n",
+			MinSpeed, TestCount, testNum, DownloadThreads)
+	}
 
 	pad := strings.Repeat(" ", len(strconv.Itoa(len(ipSet))))
 	bar := utils.NewBar(TestCount, "     "+pad, "")
@@ -75,7 +79,9 @@ func TestDownloadSpeed(ctx context.Context, ipSet utils.PingDelaySet) utils.Down
 	for i := 0; i < testNum; i++ {
 		select {
 		case <-ctx.Done():
-			utils.Yellow.Println("\n[interrupt] stop signal received, ending download test...")
+			if !utils.Quiet {
+				utils.Yellow.Println("\n[interrupt] stop signal received, ending download test...")
+			}
 			goto done
 		default:
 		}

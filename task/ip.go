@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/XIU2/CloudflareSpeedTest/utils"
 )
 
 const (
@@ -204,15 +206,21 @@ func readLocalCIDRs(filename string) []string {
 func fetchWithFallback(remoteURL, localFile, label string) []string {
 	lines, err := fetchRemoteCIDRs(remoteURL)
 	if err == nil && len(lines) > 0 {
-		fmt.Printf("[ip pool] %s: fetched %d ranges from cloudflare.com\n", label, len(lines))
+		if !utils.Quiet {
+			fmt.Printf("[ip pool] %s: fetched %d ranges from cloudflare.com\n", label, len(lines))
+		}
 		return lines
 	}
 	lines = readLocalCIDRs(localFile)
 	if len(lines) > 0 {
-		fmt.Printf("[ip pool] %s: remote unreachable, using local %s (%d ranges)\n", label, localFile, len(lines))
+		if !utils.Quiet {
+			fmt.Printf("[ip pool] %s: remote unreachable, using local %s (%d ranges)\n", label, localFile, len(lines))
+		}
 		return lines
 	}
-	fmt.Printf("[ip pool] %s: remote and local both unavailable, skipped\n", label)
+	if !utils.Quiet {
+		fmt.Printf("[ip pool] %s: remote and local both unavailable, skipped\n", label)
+	}
 	return nil
 }
 

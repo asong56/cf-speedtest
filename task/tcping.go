@@ -92,16 +92,20 @@ func (p *Ping) Run() utils.PingDelaySet {
 		return p.csv
 	}
 
-	utils.Cyan.Printf("Latency test started (mode: %s, port: %d, range: %d~%dms, max loss: %.2f)\n",
-		Mode, TCPPort,
-		utils.InputMinDelay.Milliseconds(), utils.InputMaxDelay.Milliseconds(),
-		utils.InputMaxLossRate,
-	)
+	if !utils.Quiet {
+		utils.Cyan.Printf("Latency test started (mode: %s, port: %d, range: %d~%dms, max loss: %.2f)\n",
+			Mode, TCPPort,
+			utils.InputMinDelay.Milliseconds(), utils.InputMaxDelay.Milliseconds(),
+			utils.InputMaxLossRate,
+		)
+	}
 
 	for _, ip := range p.ips {
 		select {
 		case <-p.ctx.Done():
-			utils.Yellow.Println("\n[interrupt] stop signal received, ending latency test...")
+			if !utils.Quiet {
+				utils.Yellow.Println("\n[interrupt] stop signal received, ending latency test...")
+			}
 			goto done
 		default:
 		}

@@ -25,6 +25,10 @@ var (
 	Output           = defaultOutput
 	PrintNum         = 10
 	Debug            = false
+	// Quiet suppresses status/progress chatter (banners, hints, progress bar).
+	// The result table (unless -p 0) and the CSV file are still produced, since
+	// those are the command's actual output, not information about the run.
+	Quiet = false
 )
 
 // SortMode selects how the final result set is ordered.

@@ -2,6 +2,7 @@ package utils
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 )
@@ -25,7 +26,13 @@ func NewBar(count int, prefix, suffix string) *Bar {
 	return &Bar{total: count, prefix: prefix, suffix: suffix}
 }
 
+// Grow advances the bar. It writes to stderr, not stdout: a progress bar is
+// information about the run, not the run's data output, so it must not land
+// in a pipeline (e.g. `tool ... | grep ...`) and must stay silent under -q.
 func (b *Bar) Grow(n int, status string) {
+	if Quiet {
+		return
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.current += n
@@ -34,9 +41,12 @@ func (b *Bar) Grow(n int, status string) {
 	}
 	filled := b.current * barWidth / b.total
 	bar := strings.Repeat("=", filled) + strings.Repeat("-", barWidth-filled)
-	fmt.Printf("\r%s[%s] %d/%d %s%s   ", b.prefix, bar, b.current, b.total, status, b.suffix)
+	fmt.Fprintf(os.Stderr, "\r%s[%s] %d/%d %s%s   ", b.prefix, bar, b.current, b.total, status, b.suffix)
 }
 
 func (b *Bar) Done() {
-	fmt.Println()
+	if Quiet {
+		return
+	}
+	fmt.Fprintln(os.Stderr)
 }

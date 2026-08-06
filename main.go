@@ -20,11 +20,12 @@ var version = "v3.0.0"
 
 func init() {
 	var (
-		printVersion               bool
-		minDelay, maxDelay, jitter int
-		downloadTime, tcpTimeout   int
-		maxLossRate                float64
-		modeStr, sortStr           string
+		printVersion, printVersionLong bool
+		dryRun                         bool
+		minDelay, maxDelay, jitter     int
+		downloadTime, tcpTimeout       int
+		maxLossRate                    float64
+		modeStr, sortStr               string
 	)
 
 	flag.IntVar(&task.Routines, "n", 200, "")
@@ -59,13 +60,18 @@ func init() {
 
 	flag.BoolVar(&utils.Debug, "debug", false, "")
 	flag.BoolVar(&printVersion, "v", false, "")
+	flag.BoolVar(&printVersionLong, "version", false, "")
+	flag.BoolVar(&utils.Quiet, "q", false, "")
+	flag.BoolVar(&utils.Quiet, "quiet", false, "")
+	flag.BoolVar(&dryRun, "dry-run", false, "")
 
 	flag.Usage = printHelp
 	flag.Parse()
+	printVersion = printVersion || printVersionLong
 
 	task.Mode = task.ParseMode(modeStr)
 
-	if task.MinSpeed > 0 && maxDelay == 9999 {
+	if task.MinSpeed > 0 && maxDelay == 9999 && !utils.Quiet {
 		utils.Yellow.Println("[hint] combine -sl with -tl, otherwise the test may run for a long time trying to fill -dn.")
 	}
 	utils.InputMaxDelay = time.Duration(maxDelay) * time.Millisecond
@@ -97,6 +103,53 @@ func init() {
 		}
 		os.Exit(0)
 	}
+
+	if dryRun {
+		printDryRun(modeStr, sortStr, minDelay, maxDelay, jitter, maxLossRate, downloadTime, tcpTimeout)
+		os.Exit(0)
+	}
+}
+
+// printDryRun shows the fully-resolved configuration without probing a single
+// IP, so a run can be sanity-checked (flag typos, wrong file, wrong mode)
+// before committing to a real test.
+func printDryRun(modeStr, sortStr string, minDelay, maxDelay, jitter int, maxLossRate float64, downloadTime, tcpTimeout int) {
+	p := fmt.Printf
+	p("# dry run: no probes sent, nothing written\n\n")
+
+	source := "remote fetch (cloudflare.com, falls back to " + task.IPFile + ")"
+	if task.IPText != "" {
+		source = "-ip " + task.IPText
+	} else if task.IPFile != "" && task.IPFile != "ip.txt" {
+		source = "-f " + task.IPFile
+	}
+
+	p("input:\n")
+	p("  source        %s\n", source)
+	p("  test all IPs  %v\n\n", task.TestAll)
+
+	p("latency test:\n")
+	p("  mode          %s (port %d)\n", modeStr, task.TCPPort)
+	p("  concurrency   %d\n", task.Routines)
+	p("  pings/IP      %d, timeout %dms\n", task.PingTimes, tcpTimeout)
+	p("  delay range   %d~%dms, max loss %.2f, max jitter %dms\n\n", minDelay, maxDelay, maxLossRate, jitter)
+
+	p("download test:\n")
+	if task.Disable {
+		p("  disabled (-dd); results sorted by delay\n\n")
+	} else {
+		p("  target IPs    %d, duration %ds each, %d thread(s)/IP\n", task.TestCount, downloadTime, task.DownloadThreads)
+		p("  min speed     %.2f MB/s\n\n", task.MinSpeed)
+	}
+
+	p("output:\n")
+	if utils.Output == "" {
+		p("  csv file      (disabled)\n")
+	} else {
+		p("  csv file      %s\n", utils.Output)
+	}
+	p("  print rows    %d\n", utils.PrintNum)
+	p("  sort by       %s\n", sortStr)
 }
 
 func main() {
@@ -106,7 +159,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	fmt.Printf("# CloudflareSpeedTest %s\n\n", version)
+	if !utils.Quiet {
+		fmt.Printf("# CloudflareSpeedTest %s\n\n", version)
+	}
 
 	pingData := task.NewPing(ctx).Run().FilterDelay().FilterLossRate().FilterJitter()
 	speedData := task.TestDownloadSpeed(ctx, pingData)
@@ -118,7 +173,7 @@ func main() {
 
 // endPrint keeps the window open when double-clicked on Windows.
 func endPrint() {
-	if utils.NoPrintResult() {
+	if utils.NoPrintResult() || utils.Quiet {
 		return
 	}
 	if runtime.GOOS == "windows" {
@@ -205,9 +260,12 @@ func printHelp() {
 
 	p("\n")
 	h("[Other]\n")
-	p("  -debug   print verbose debug logs\n")
-	p("  -v       print version and check for updates\n")
-	p("  -h       show this help\n")
+	p("  -debug          print verbose debug logs\n")
+	p("  -q, -quiet      suppress banners/progress/hints; still prints results and writes csv\n")
+	dim("                  pair with -o \"\" and -p 0 for a pure exit-code check\n")
+	p("  --dry-run       show the resolved configuration and exit, no probes sent\n")
+	p("  -v, --version   print version and check for updates\n")
+	p("  -h, --help      show this help\n")
 
 	p("\n")
 	h("[Examples]\n")
@@ -225,5 +283,11 @@ func printHelp() {
 	p("\n")
 	p("  # low-power device: fewer threads, shorter timeout\n")
 	utils.Green.Println("  CloudflareSpeedTest -n 50 -ct 500 -tl 300")
+	p("\n")
+	p("  # sanity-check flags before a real run\n")
+	utils.Green.Println("  CloudflareSpeedTest -m http -colo HKG --dry-run")
+	p("\n")
+	p("  # scripted use: only the exit code and csv matter\n")
+	utils.Green.Println("  CloudflareSpeedTest -q -p 0 -o result.csv")
 	p("\n")
 }
